@@ -1,0 +1,421 @@
+/**
+ * ORIENTATION WELCOME LETTER SENDER + GOOGLE WORKSPACE ACCOUNT CREATOR
+ * -----------------------------------------------------------------------
+ * Every Tuesday, for each person on the current orientation list:
+ *   1. If they don't have a Work Email yet, creates a real Google
+ *      Workspace account for them via the Admin Directory API.
+ *   2. On success, writes the new email into the "Work Email" column.
+ *   3. On failure, leaves that row's Work Email cell shaded RED and
+ *      skips that person entirely (no letter/email sent) so you can
+ *      fix it by hand and re-run.
+ *   4. For anyone who already has a working email (existing or just
+ *      created), fills in the welcome letter template and emails it
+ *      as a PDF.
+ *
+ * TAB SELECTION:
+ * Looks for the tab whose name is the current week's date, formatted like
+ * "8/25/2026". It tries today and the most recent Tuesday, in a few
+ * common formats (zero-padded, 2-digit year).
+ *
+ * GMAIL / THERAP / QUICKMAR CREDENTIALS IN THE LETTER:
+ * The username for all three systems is the local part of the person's
+ * work email (e.g. "galewis@onediversity.org" -> "galewis"). The script
+ * fills this into the specific blank lines in the welcome letter template:
+ *   "Email: @onediversity.org"    -> "Email: galewis@onediversity.org"
+ *   "Username:" (under Therap)    -> "Username: galewis"
+ *   "Username: @diversity"        -> "Username: galewis@diversity"
+ *
+ * SENT COLUMN:
+ * If the sheet has no "Sent" column, the script adds one automatically.
+ *
+ * ONE-TIME SETUP:
+ * 1. Extensions > Apps Script, paste this file in.
+ * 2. Services (+) > add "Admin SDK API" (AdminDirectory).
+ * 3. Run as a Google Workspace super admin (or admin with "Create users").
+ * 4. Fill in CONFIG below. Name each week's tab like "8/25/2026".
+ * 5. Run `sendOrientationLetters` once manually to authorize.
+ * 6. Optional: run `createWeeklyTrigger` once for automatic Tuesday runs.
+ */
+
+const CONFIG = {
+  // ID from your sheet's URL: .../d/SHEET_ID/edit
+  SHEET_ID: '1h3Tru3fJFuv6mdMaGeZHG-ytRZ-QNY_Z48HibK61kko',
+
+  // ID from your welcome letter template URL: .../d/TEMPLATE_ID/edit
+  TEMPLATE_DOC_ID: '1_617Hjl4i4y5OrZ8sliZOpg3zlt2wQsnImPNalzd6xM',
+
+  // Optional: Drive folder ID to save generated letters/PDFs into.
+  OUTPUT_FOLDER_ID: '',
+
+  // Column headers exactly as they appear in row 1
+  NAME_COLUMN: 'Name',
+  PERSONAL_EMAIL_COLUMN: 'Email',
+  WORK_EMAIL_COLUMN: 'Work Email',
+  SENT_COLUMN: 'Sent',
+
+  // Domain used when auto-generating a missing work email
+  WORK_EMAIL_DOMAIN: 'onediversity.org',
+
+  // Org Unit path new Workspace accounts are created under.
+  ORG_UNIT_PATH: '/',
+
+  // Password set on every newly created Workspace account. Everyone is
+  // forced to change it on first login.
+  NEW_ACCOUNT_PASSWORD: 'Diversity',
+
+  // Subject line for the welcome email. {{Field}} placeholders work here too.
+  EMAIL_SUBJECT: 'Welcome to the Team, {{Name}}!',
+
+  // Plain-text body of the email itself (the letter is attached as PDF).
+  EMAIL_BODY: `Hi {{Name}},
+
+Welcome aboard! Please find your official welcome letter attached.
+
+We're excited to have you starting orientation this week.
+
+Please note: pictures will be taken on Friday at 9:00 AM.
+
+Best,
+HR Team`,
+
+  // Color used to flag a row whose Workspace account failed to create.
+  ERROR_COLOR: '#f4cccc',
+};
+
+/**
+ * Main entry point — run this manually or on the Tuesday trigger.
+ */
+function sendOrientationLetters() {
+  const ss = SpreadsheetApp.openById(CONFIG.SHEET_ID);
+  const sheet = findWeeklySheet(ss);
+  if (!sheet) {
+    throw new Error(
+      'Could not find a tab named for this week\'s date (tried today and the ' +
+      'most recent Tuesday, in a few date formats). Check that this week\'s ' +
+      'tab exists and is named like "8/25/2026".'
+    );
+  }
+  Logger.log(`Using tab: "${sheet.getName()}"`);
+
+  let headers = sheet.getDataRange().getValues()[0].map(h => String(h).trim());
+
+  const nameColIdx = headers.indexOf(CONFIG.NAME_COLUMN);
+  const personalEmailColIdx = headers.indexOf(CONFIG.PERSONAL_EMAIL_COLUMN);
+  const workEmailColIdx = headers.indexOf(CONFIG.WORK_EMAIL_COLUMN);
+
+  if (nameColIdx === -1) throw new Error(`Column "${CONFIG.NAME_COLUMN}" not found in row 1.`);
+  if (personalEmailColIdx === -1) throw new Error(`Column "${CONFIG.PERSONAL_EMAIL_COLUMN}" not found in row 1.`);
+  if (workEmailColIdx === -1) throw new Error(`Column "${CONFIG.WORK_EMAIL_COLUMN}" not found in row 1.`);
+
+  // Find (or create) the "Sent" column, rather than failing if it's missing.
+  const sentColIdx = getOrCreateSentColumn(sheet, headers);
+  headers = sheet.getDataRange().getValues()[0].map(h => String(h).trim()); // re-read in case a column was appended
+
+  const data = sheet.getDataRange().getValues();
+
+  const workEmailCol = workEmailColIdx + 1; // 1-based for Range calls
+  let sentCount = 0;
+  let createdCount = 0;
+  let failedCount = 0;
+
+  for (let r = 1; r < data.length; r++) {
+    const row = data[r];
+    const sheetRow = r + 1; // 1-based row number on the sheet
+    const name = String(row[nameColIdx] || '').trim();
+    let workEmail = String(row[workEmailColIdx] || '').trim();
+    const alreadySent = row[sentColIdx];
+
+    if (!name || alreadySent) continue;
+
+    const workEmailCell = sheet.getRange(sheetRow, workEmailCol);
+
+    // If there's no work email yet, create a real Workspace account for them.
+    if (!workEmail) {
+      const candidateEmail = generateWorkEmail(name);
+      if (!candidateEmail) {
+        Logger.log(`Skipping row ${sheetRow} (${name}): could not derive a work email from the name.`);
+        workEmailCell.setBackground(CONFIG.ERROR_COLOR);
+        failedCount++;
+        continue;
+      }
+
+      const result = createWorkspaceAccount(candidateEmail, name);
+      if (!result.success) {
+        Logger.log(`Skipping row ${sheetRow} (${name}): account creation failed — ${result.error}`);
+        workEmailCell.setBackground(CONFIG.ERROR_COLOR);
+        failedCount++;
+        continue; // leave the red box, don't send a letter, move to next person
+      }
+
+      // Success: write the new email into the sheet and clear any old error color.
+      workEmail = candidateEmail;
+      workEmailCell.setValue(workEmail);
+      workEmailCell.setBackground(null);
+      row[workEmailColIdx] = workEmail;
+      createdCount++;
+    }
+
+    // Build a { header: value } map for this row (used for placeholders)
+    const rowData = {};
+    headers.forEach((h, i) => { rowData[h] = row[i]; });
+
+    // Therap and QuickMAR usernames are just the work email's local part.
+    // Not written back to the sheet.
+    const emailUsername = workEmail.split('@')[0];
+    rowData['Therap Username'] = emailUsername;
+    rowData['QuickMAR Username'] = emailUsername;
+
+    try {
+      const pdfBlob = generateWelcomeLetterPdf(rowData);
+      sendWelcomeEmail(workEmail, rowData, pdfBlob);
+
+      // Mark as sent
+      sheet.getRange(sheetRow, sentColIdx + 1).setValue(new Date());
+      sentCount++;
+    } catch (err) {
+      Logger.log(`Failed to send letter for row ${sheetRow} (${name}): ${err}`);
+    }
+  }
+
+  Logger.log(`Done. Created ${createdCount} account(s), sent ${sentCount} welcome letter(s), ${failedCount} failure(s) flagged red.`);
+}
+
+/**
+ * Finds the tab for "this week" by matching its name against candidate
+ * date strings: today and the most recent Tuesday, each rendered a few
+ * common ways. Returns the matching Sheet, or null.
+ */
+function findWeeklySheet(ss) {
+  const tz = Session.getScriptTimeZone();
+  const today = new Date();
+
+  // Most recent Tuesday on/before today. getDay(): 0=Sun,1=Mon,2=Tue,...
+  const tuesday = new Date(today);
+  const dayOfWeek = tuesday.getDay();
+  const diffToTuesday = (dayOfWeek - 2 + 7) % 7;
+  tuesday.setDate(tuesday.getDate() - diffToTuesday);
+
+  const candidateDates = [today, tuesday];
+  const candidateNames = new Set();
+
+  candidateDates.forEach(d => {
+    candidateNames.add(Utilities.formatDate(d, tz, 'M/d/yyyy'));
+    candidateNames.add(Utilities.formatDate(d, tz, 'MM/dd/yyyy'));
+    candidateNames.add(Utilities.formatDate(d, tz, 'M/d/yy'));
+  });
+
+  const sheets = ss.getSheets();
+  for (const name of candidateNames) {
+    const match = sheets.find(s => s.getName().trim() === name);
+    if (match) return match;
+  }
+  return null;
+}
+
+/**
+ * Looks for a header matching CONFIG.SENT_COLUMN. If missing, appends a
+ * new column with that header. Returns the 0-based column index.
+ */
+function getOrCreateSentColumn(sheet, headers) {
+  let idx = headers.indexOf(CONFIG.SENT_COLUMN);
+  if (idx !== -1) return idx;
+
+  const newCol = sheet.getLastColumn() + 1;
+  sheet.getRange(1, newCol).setValue(CONFIG.SENT_COLUMN);
+  Logger.log(`No "${CONFIG.SENT_COLUMN}" column found — added one in column ${newCol}.`);
+  return newCol - 1;
+}
+
+/**
+ * Creates a Google Workspace user account via the Admin Directory API.
+ * Returns { success: true } or { success: false, error: <message> }.
+ * Never throws.
+ */
+function createWorkspaceAccount(workEmail, fullName) {
+  const parts = fullName.trim().split(/\s+/).filter(Boolean);
+  const givenName = parts[0] || fullName;
+  const familyName = parts.length > 1 ? parts[parts.length - 1] : '-';
+
+  const newUser = {
+    primaryEmail: workEmail,
+    name: {
+      givenName: givenName,
+      familyName: familyName,
+    },
+    password: CONFIG.NEW_ACCOUNT_PASSWORD,
+    changePasswordAtNextLogin: true,
+    orgUnitPath: CONFIG.ORG_UNIT_PATH,
+  };
+
+  try {
+    AdminDirectory.Users.insert(newUser);
+    return { success: true };
+  } catch (err) {
+    return { success: false, error: err && err.message ? err.message : String(err) };
+  }
+}
+
+/**
+ * Generates "[first initial][last name]@domain" from a full name.
+ * "Gabrielle Lewis" -> "glewis@onediversity.org"
+ */
+function generateWorkEmail(fullName) {
+  const parts = fullName.trim().split(/\s+/).filter(Boolean);
+  if (parts.length < 2) return '';
+
+  const firstInitial = parts[0].charAt(0).toLowerCase();
+  const lastName = parts[parts.length - 1].toLowerCase().replace(/[^a-z]/g, '');
+
+  if (!firstInitial || !lastName) return '';
+  return `${firstInitial}${lastName}@${CONFIG.WORK_EMAIL_DOMAIN}`;
+}
+
+/**
+ * Copies the template doc, replaces {{Placeholders}}, fills in the
+ * credential blanks, exports as PDF, and trashes the temporary copy.
+ */
+function generateWelcomeLetterPdf(rowData) {
+  const template = DriveApp.getFileById(CONFIG.TEMPLATE_DOC_ID);
+  const folder = CONFIG.OUTPUT_FOLDER_ID
+    ? DriveApp.getFolderById(CONFIG.OUTPUT_FOLDER_ID)
+    : DriveApp.getRootFolder();
+
+  const name = rowData[CONFIG.NAME_COLUMN] || 'Staff Member';
+  const copyName = `Welcome Letter - ${name} - ${Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd')}`;
+  const copyFile = template.makeCopy(copyName, folder);
+
+  const doc = DocumentApp.openById(copyFile.getId());
+  const body = doc.getBody();
+
+  // Support {{Placeholder}}-style tokens, in case any exist in the template.
+  Object.keys(rowData).forEach(header => {
+    const placeholder = `{{${header}}}`;
+    const value = formatValue(rowData[header]);
+    body.replaceText(escapeForRegex(placeholder), value);
+  });
+
+  // Fill in the template's blank credential lines.
+  const workEmail = String(rowData[CONFIG.WORK_EMAIL_COLUMN] || '');
+  const username = workEmail.split('@')[0];
+  if (username) {
+    fillCredentialBlanks(body, username);
+  } else {
+    Logger.log(`No work email available for "${name}" — skipped filling in credential blanks.`);
+  }
+
+  doc.saveAndClose();
+
+  const pdfBlob = DriveApp.getFileById(copyFile.getId()).getAs('application/pdf');
+  pdfBlob.setName(`${copyName}.pdf`);
+
+  // Remove the intermediate Doc copy, keep only the PDF attachment.
+  DriveApp.getFileById(copyFile.getId()).setTrashed(true);
+
+  return pdfBlob;
+}
+
+/**
+ * Sends the welcome email with the PDF letter attached.
+ */
+function sendWelcomeEmail(toEmail, rowData, pdfBlob) {
+  const subject = fillPlaceholders(CONFIG.EMAIL_SUBJECT, rowData);
+  const body = fillPlaceholders(CONFIG.EMAIL_BODY, rowData);
+
+  GmailApp.sendEmail(toEmail, subject, body, {
+    attachments: [pdfBlob],
+    name: 'HR Team',
+  });
+}
+
+/** Replaces {{Header}} tokens in a plain string using row data. */
+function fillPlaceholders(text, rowData) {
+  let result = text;
+  Object.keys(rowData).forEach(header => {
+    const placeholder = `{{${header}}}`;
+    result = result.split(placeholder).join(formatValue(rowData[header]));
+  });
+  return result;
+}
+
+/** Formats dates nicely; passes through everything else as a string. */
+function formatValue(value) {
+  if (value instanceof Date) {
+    return Utilities.formatDate(value, Session.getScriptTimeZone(), 'MMMM d, yyyy');
+  }
+  return value === null || value === undefined ? '' : String(value);
+}
+
+/**
+ * Fills in the three blank credential lines in the welcome letter
+ * template without touching surrounding text:
+ *
+ *   "Email: @onediversity.org"        -> "Email: {username}@onediversity.org"
+ *   "Username:" (Therap block)        -> "Username: {username}"
+ *   "Username: @diversity" (QuickMar) -> "Username: {username}@diversity"
+ *
+ * Logs a warning if any expected line isn't found.
+ */
+function fillCredentialBlanks(body, username) {
+  const found = { email: false, therap: false, quickmar: false };
+  const total = body.getNumChildren();
+
+  for (let i = 0; i < total; i++) {
+    const child = body.getChild(i);
+    let textEl;
+    try {
+      textEl = child.editAsText();
+    } catch (e) {
+      continue; // element without editable text (e.g. an image or table — skip)
+    }
+
+    const text = textEl.getText();
+    const trimmed = text.trim();
+
+    if (trimmed === 'Email: @onediversity.org') {
+      const atIdx = text.indexOf('@onediversity.org');
+      if (atIdx !== -1) {
+        textEl.insertText(atIdx, username);
+        found.email = true;
+      }
+    } else if (trimmed === 'Username: @diversity') {
+      const atIdx = text.indexOf('@diversity');
+      if (atIdx !== -1) {
+        textEl.insertText(atIdx, username);
+        found.quickmar = true;
+      }
+    } else if (trimmed === 'Username:') {
+      const insertAt = text.indexOf('Username:') + 'Username:'.length;
+      textEl.insertText(insertAt, ' ' + username);
+      found.therap = true;
+    }
+  }
+
+  if (!found.email) Logger.log('Warning: could not find the "Email: @onediversity.org" line in the template — Gmail email was not filled in.');
+  if (!found.therap) Logger.log('Warning: could not find the blank "Username:" (Therap) line in the template — Therap username was not filled in.');
+  if (!found.quickmar) Logger.log('Warning: could not find the "Username: @diversity" line in the template — QuickMar username was not filled in.');
+}
+
+function escapeForRegex(text) {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Run this ONCE to set up an automatic trigger that fires every Tuesday
+ * at 8am.
+ */
+function createWeeklyTrigger() {
+  // Remove any existing triggers for this function first, to avoid duplicates
+  ScriptApp.getProjectTriggers().forEach(t => {
+    if (t.getHandlerFunction() === 'sendOrientationLetters') {
+      ScriptApp.deleteTrigger(t);
+    }
+  });
+
+  ScriptApp.newTrigger('sendOrientationLetters')
+    .timeBased()
+    .onWeekDay(ScriptApp.WeekDay.TUESDAY)
+    .atHour(8)
+    .create();
+
+  Logger.log('Weekly trigger created: every Tuesday at 8am.');
+}

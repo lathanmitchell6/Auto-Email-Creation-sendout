@@ -39,10 +39,10 @@
 
 const CONFIG = {
   // ID from your sheet's URL: .../d/SHEET_ID/edit
-  SHEET_ID: '1h3Tru3fJFuv6mdMaGeZHG-ytRZ-QNY_Z48HibK61kko',
+  SHEET_ID: 'placeholder',
 
   // ID from your welcome letter template URL: .../d/TEMPLATE_ID/edit
-  TEMPLATE_DOC_ID: '1_617Hjl4i4y5OrZ8sliZOpg3zlt2wQsnImPNalzd6xM',
+  TEMPLATE_DOC_ID: 'placeholder',
 
   // Optional: Drive folder ID to save generated letters/PDFs into.
   OUTPUT_FOLDER_ID: '',
@@ -54,14 +54,14 @@ const CONFIG = {
   SENT_COLUMN: 'Sent',
 
   // Domain used when auto-generating a missing work email
-  WORK_EMAIL_DOMAIN: 'onediversity.org',
+  WORK_EMAIL_DOMAIN: 'placeholder',
 
   // Org Unit path new Workspace accounts are created under.
   ORG_UNIT_PATH: '/',
 
   // Password set on every newly created Workspace account. Everyone is
   // forced to change it on first login.
-  NEW_ACCOUNT_PASSWORD: 'Diversity',
+  NEW_ACCOUNT_PASSWORD: 'placeholder',
 
   // Subject line for the welcome email. {{Field}} placeholders work here too.
   EMAIL_SUBJECT: 'Welcome to the Team, {{Name}}!',
